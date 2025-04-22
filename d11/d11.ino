@@ -3,19 +3,17 @@
 #include <Adafruit_SSD1306.h>
 #include <stdlib.h>
 
-/* --- FreeRTOS core setup --- */
 #if CONFIG_FREERTOS_UNICORE
   static const BaseType_t app_cpu = 0;
 #else
   static const BaseType_t app_cpu = 1;
 #endif
 
+#define N_PINS 4
 #define DISP_W 128
 #define DISP_H 64
 #define RESET -1
 Adafruit_SSD1306 oled(DISP_W, DISP_H, &Wire, RESET);
-
-#define N_PINS 4
 
 const uint8_t led_pins[] = {25, 33, 32, 12};
 const uint8_t btn_pins[] = {13, 14, 27, 26};
@@ -40,6 +38,7 @@ QueueHandle_t rtq;
 void setup(void)
 {
   Serial.begin(115200);
+  randomSeed(analogRead(0));
 
   /* initialize pins */
   for (uint8_t i = 0; i < N_PINS; i++) {
