@@ -1,123 +1,131 @@
-// Bruker kun kjerne 1 for demonstrasjon
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <stdlib.h>
+
+/* --- FreeRTOS core setup --- */
 #if CONFIG_FREERTOS_UNICORE
   static const BaseType_t app_cpu = 0;
 #else
   static const BaseType_t app_cpu = 1;
 #endif
 
-#define DISP_W 128 /* display width */
-#define DISP_H 64 /* display height */
-#define RST -1 /* reset */
-
-#include <SPI.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#define DISP_W 128
+#define DISP_H 64
+#define RESET -1
+Adafruit_SSD1306 oled(DISP_W, DISP_H, &Wire, RESET);
 
 #define N_PINS 4
 
-#define L1 25
-#define L2 33
-#define L3 32
-#define L4 12
+const uint8_t led_pins[] = {25, 33, 32, 12};
+const uint8_t btn_pins[] = {13, 14, 27, 26};
 
-#define B1 13
-#define B2 14
-#define B2 27
-#define B2 25
+#define TRIG_MIN 500
+#define TRIG_MAX 1500
+volatile uint8_t led = RESET;
+unsigned long led_on_ms = 0;
+uint8_t wait = 0;
 
+/* mutex for shared state */
+SemaphoreHandle_t mut;
 
-/* check if leds.state[i] == btns.state[i] */
-Adafruit_SSD1306 display(DISP_W, DISP_H, &Wire, RST);
+/* task handles */
+TaskHandle_t leds_handle = NULL;
+TaskHandle_t btns_handle = NULL;
+TaskHandle_t oled_handle = NULL;
 
-struct port {
-  uint8_t pins[N_PINS];
-  uint8_t states[N_PINS];
-};
+/* queue to send reaction time to display */
+QueueHandle_t rtq;
 
-struct port btns = {{B1, B2, B3, B4}, {0}};
-struct port leds = {{L1, L2, L3, L4}, {0}};
-
-/* ensures ID is saved in the interactor task, identifies which button is pressed */
-static SemaphoreHandle_t bin_sem;
-
-/* identifier for interactor task */
-static TaskHandle_t interactor_task;
-
-/* ISR for button presses. awakens the interactor task thread */
-void IRAM_ATTR ISR_BTN() {
-  BaseType_t task_woken = pdFALSE;
-
-  vTaskNotifyGiveFromISR(interactor_task, &task_woken);
-
-  if (task_woken) {
-    portYIELD_FROM_ISR();
-  }
-}
-
-/*
-* Interactor-oppgaven, som reagerer pÃ¥ knappetrykk og styrer en LED basert pÃ¥ dette. Laget for Ã¥ kunne brukes for
-* flere knappe-LED-par ved Ã¥ ha en parameteriserbar ID.  En binÃ¦r semafor brukes for Ã¥ signalisere at IDen er lagret lokalt.
-*/
-void interactor(void *parameters) {
-  int interactor_id = *(int *)parameters;
-
-  for (uint8_t i = 0; i < N_PINS; i++)
-    leds.states[i] = 0;
-
-  Serial.print("task ready:");
-  Serial.println(interactor_id);
-  
-  xSemaphoreGive(bin_sem);
-  while(1) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    for (uint8_t i = 0; i < N_PINS; i++) {
-      digitalWrite(leds.pins[i],leds.states[i]);
-      leds.states[i] = !leds.states[i];
-    }
-  }
-}
-
-void setup()
+void setup(void)
 {
   Serial.begin(115200);
 
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
-    Serial.println("display: allocation failed");
-
-  display.display();
-  delay(100);
-  display.clearDisplay();
-
-  Serial.println("--- reaction trainer ---");
-
-  char task_name[14];
-  uint8_t interactor_id = 0;
-
-  bin_sem = xSemaphoreCreateBinary();
-
+  /* initialize pins */
   for (uint8_t i = 0; i < N_PINS; i++) {
-    pinMode(btns.pins[i], INPUT_PULLUP);
-    pinMode(leds.pins[i], OUTPUT);
+    pinMode(led_pins[i], OUTPUT);
+    pinMode(btn_pins[i], INPUT_PULLUP);
   }
 
-  for (uint8_t i = 0; i < N_PINS; i++)
-    attachInterrupt(btns.pins[i], ISR_BTN, FALLING); /* attach interrupts to buttons*/
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+    Serial.println("oled: allocation failed");
 
-  sprintf(task_name, "interactor %i", interactor_id);
-  xTaskCreatePinnedToCore(
-    interactor,
-    task_name,
-    1024,
-    (void *)&interactor_id,
-    1,
-    &interactor_task,
-    app_cpu
-    );
-  xSemaphoreTake(bin_sem, portMAX_DELAY);
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(0, 0);
+  oled.print("reaction trainer");
+  oled.display();
+
+  /* initialize mutex and queue */
+  mut = xSemaphoreCreateMutex();
+  rtq = xQueueCreate(1, sizeof(unsigned long));
+
+  /* create tasks */
+  xTaskCreatePinnedToCore(task_leds, "leds", 2048, NULL, 1, &leds_handle, app_cpu);
+  xTaskCreatePinnedToCore(task_btns, "btns", 2048, NULL, 2, &btns_handle, app_cpu);
+  xTaskCreatePinnedToCore(task_oled, "oled", 2048, NULL, 1, &oled_handle, app_cpu);
 }
 
-void loop()
+void loop(void)
 {
   /* empty */
+}
+
+void task_leds(void *params)
+{
+  while (1) {
+    if (!wait) {
+      uint8_t r = random(0, N_PINS);
+      xSemaphoreTake(mut, portMAX_DELAY);
+      led = r;
+      led_on_ms = millis();
+      wait = 1;
+      digitalWrite(led_pins[r], HIGH);
+      xSemaphoreGive(mut); 
+    }
+    vTaskDelay(pdMS_TO_TICKS(500 + random(TRIG_MIN, TRIG_MAX)));
+  }
+}
+
+void task_btns(void *params)
+{
+  while (1) {
+    if (wait) {
+      for (uint8_t i = 0; i < N_PINS; i++) {
+        if (digitalRead(btn_pins[i]) == LOW) {
+          xSemaphoreTake(mut, portMAX_DELAY);
+          if (i == led) {
+            unsigned long t = millis() - led_on_ms;
+            digitalWrite(led_pins[led], LOW);
+            led = RESET;
+            wait = 0;
+            xQueueSend(rtq, &t, portMAX_DELAY);
+          }
+          xSemaphoreGive(mut);
+          while (digitalRead(btn_pins[i]) == LOW)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void task_oled(void *params)
+{
+  unsigned long t;
+  while (1) {
+    if (xQueueReceive(rtq, &t, portMAX_DELAY)) {
+      oled.clearDisplay();
+      oled.setCursor(0, 0);
+      oled.print("reaction time:");
+      oled.setCursor(0, 20);
+      oled.setTextSize(2);
+      oled.print(t);
+      oled.print(" ms");
+      oled.setTextSize(1);
+      oled.display();
+    }
+  }
 }
