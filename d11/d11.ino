@@ -1,7 +1,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <stdlib.h>
+#include <Preferences.h> // https://github.com/vshymanskyy/Preferences
 
 #if CONFIG_FREERTOS_UNICORE
   static const BaseType_t app_cpu = 0;
@@ -9,15 +9,21 @@
   static const BaseType_t app_cpu = 1;
 #endif
 
-#define N_PINS 4
+/*--- game ---*/
+#define DEFAULT_HS 9999
+
+/*--- oled ---*/
 #define DISP_W 128
 #define DISP_H 64
 #define RESET -1
 Adafruit_SSD1306 oled(DISP_W, DISP_H, &Wire, RESET);
 
+/*--- pins ---*/
+#define N_PINS 4
 const uint8_t led_pins[] = {25, 33, 32, 12};
 const uint8_t btn_pins[] = {13, 14, 27, 26};
 
+/*--- leds ---*/
 #define TRIG_MIN 500
 #define TRIG_MAX 1500
 volatile uint8_t led = RESET;
@@ -35,12 +41,14 @@ TaskHandle_t oled_handle = NULL;
 /* queue to send reaction time to display */
 QueueHandle_t rtq;
 
+/* for saving high score to non-volatile memory */
+Preferences prefs;
+
 void setup(void)
 {
   Serial.begin(115200);
-  randomSeed(analogRead(0));
+  randomSeed(analogRead(34));
 
-  /* initialize pins */
   for (uint8_t i = 0; i < N_PINS; i++) {
     pinMode(led_pins[i], OUTPUT);
     pinMode(btn_pins[i], INPUT_PULLUP);
@@ -53,8 +61,24 @@ void setup(void)
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
   oled.setCursor(0, 0);
-  oled.print("reaction trainer");
+  oled.print("react!");
   oled.display();
+
+  prefs.begin("react", false);
+
+  /* optionally reset high score */
+  if (digitalRead(btn_pins[0]) == LOW) {
+    prefs.putULong("highscore", DEFAULT_HS);
+    oled.clearDisplay();
+    oled.setCursor(0, 0);
+    oled.setTextSize(2);
+    oled.print("reset");
+    oled.display();
+    Serial.println("game: high score reset");
+
+    while (digitalRead(btn_pins[0]) == LOW)
+      delay(10);
+  }
 
   /* initialize mutex and queue */
   mut = xSemaphoreCreateMutex();
@@ -95,11 +119,11 @@ void task_btns(void *params)
         if (digitalRead(btn_pins[i]) == LOW) {
           xSemaphoreTake(mut, portMAX_DELAY);
           if (i == led) {
-            unsigned long t = millis() - led_on_ms;
+            unsigned long rt = millis() - led_on_ms;
             digitalWrite(led_pins[led], LOW);
             led = RESET;
             wait = 0;
-            xQueueSend(rtq, &t, portMAX_DELAY);
+            xQueueSend(rtq, &rt, portMAX_DELAY);
           }
           xSemaphoreGive(mut);
           while (digitalRead(btn_pins[i]) == LOW)
@@ -113,18 +137,36 @@ void task_btns(void *params)
 
 void task_oled(void *params)
 {
-  unsigned long t;
+  unsigned long rt;
+  unsigned long hs = prefs.getULong("highscore", DEFAULT_HS);
+
   while (1) {
-    if (xQueueReceive(rtq, &t, portMAX_DELAY)) {
+    if (xQueueReceive(rtq, &rt, portMAX_DELAY)) {
+      uint8_t new_hs = 0;
+      if (rt < hs) {
+        hs = rt;
+        prefs.putULong("highscore", hs);
+        new_hs = 1;
+      }
+
       oled.clearDisplay();
       oled.setCursor(0, 0);
       oled.print("reaction time:");
       oled.setCursor(0, 20);
       oled.setTextSize(2);
-      oled.print(t);
+      oled.print(rt);
       oled.print(" ms");
       oled.setTextSize(1);
-      oled.display();
+
+      oled.setCursor(0, 48);
+      if (new_hs)
+        oled.print("new high score!");
+      else {
+        oled.print("best: ");
+        oled.print(hs);
+        oled.print(" ms");
+      }
+      oled.display();    
     }
   }
 }
